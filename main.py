@@ -29,9 +29,32 @@ mcp = FastMCP("yfinance-server")
 def serialize_data(data):
     """Convert pandas DataFrames and other objects to JSON-serializable format"""
     if isinstance(data, pd.DataFrame):
-        return data.to_dict('records')
+        df = data.copy()
+
+        # Preserve DatetimeIndex from yfinance (history uses index as timestamp)
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index()  # index -> column (often 'Date' or 'Datetime')
+            if "Date" in df.columns and "Datetime" not in df.columns:
+                df = df.rename(columns={"Date": "Datetime"})
+            elif df.columns[0] == "index":
+                df = df.rename(columns={"index": "Datetime"})
+
+            # Make datetime JSON-friendly
+            if "Datetime" in df.columns:
+                df["Datetime"] = (
+                    pd.to_datetime(df["Datetime"], errors="coerce")
+                      .dt.strftime("%Y-%m-%d %H:%M:%S")
+                )
+
+        return df.to_dict("records")
+
     elif isinstance(data, pd.Series):
+        if isinstance(data.index, pd.DatetimeIndex):
+            s = data.copy()
+            s.index = s.index.strftime("%Y-%m-%d %H:%M:%S")
+            return s.to_dict()
         return data.to_dict()
+
     elif isinstance(data, dict):
         return {k: serialize_data(v) for k, v in data.items()}
     elif isinstance(data, list):
