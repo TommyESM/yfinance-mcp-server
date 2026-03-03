@@ -1,5 +1,6 @@
 yfinance
 fastmcp
 pandas
+numpy
 python-dotenv
 setuptools_scm
