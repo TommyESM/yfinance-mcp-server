@@ -372,6 +372,68 @@ def get_multiple_stocks_history(
     except Exception as e:
         return {"error": str(e), "symbols": symbols}
 
+@mcp.tool()
+def download_multiindex(
+    symbols: List[str],
+    start: Optional[str] = None,   # "YYYY-MM-DD"
+    end: Optional[str] = None,     # "YYYY-MM-DD"
+    interval: str = "1d",
+    auto_adjust: bool = False,
+    group_by: str = "ticker",
+    threads: bool = True,
+    progress: bool = False,
+) -> Dict[str, Any]:
+    """
+    Download multiple tickers and return a payload that can be reconstructed into
+    a pandas DataFrame with MultiIndex columns (like yf.download(group_by='ticker')).
+    """
+    try:
+        df = yf.download(
+            symbols,
+            start=start,
+            end=end,
+            interval=interval,
+            auto_adjust=auto_adjust,
+            group_by=group_by,
+            progress=progress,
+            threads=threads,
+        )
+
+        # Ensure index is serializable (timestamps -> iso)
+        idx = []
+        for x in df.index:
+            try:
+                idx.append(pd.Timestamp(x).isoformat())
+            except Exception:
+                idx.append(str(x))
+
+        # Columns: support both MultiIndex and normal Index (single ticker case)
+        if isinstance(df.columns, pd.MultiIndex):
+            cols = [list(map(str, tup)) for tup in df.columns.to_list()]  # [["AAPL","Open"], ...]
+            col_kind = "multi"
+        else:
+            cols = [str(c) for c in df.columns.to_list()]                 # ["Open","High",...]
+            col_kind = "single"
+
+        values = df.to_numpy().tolist()
+
+        payload = {
+            "symbols": symbols,
+            "start": start,
+            "end": end,
+            "interval": interval,
+            "auto_adjust": auto_adjust,
+            "group_by": group_by,
+            "columns_kind": col_kind,
+            "columns": cols,
+            "index": idx,
+            "values": values,
+        }
+        return serialize_data(payload)
+
+    except Exception as e:
+        return {"error": str(e), "symbols": symbols}
+
 # ============================================================================
 # FINANCIAL STATEMENTS TOOLS
 # ============================================================================
