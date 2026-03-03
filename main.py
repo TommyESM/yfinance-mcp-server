@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Any
 
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from fastmcp import FastMCP
 
 # Configure logging
@@ -83,6 +84,225 @@ def get_stock_info(symbol: str) -> Dict[str, Any]:
         ticker = yf.Ticker(symbol)
         info = ticker.info
         return serialize_data(info)
+    except Exception as e:
+        return {"error": str(e), "symbol": symbol}
+
+@mcp.tool()
+def get_fundamentals_key_metrics(symbol: str) -> Dict[str, Any]:
+    """
+    Return a compact fundamentals payload (key metrics) derived from yfinance Ticker.info.
+
+    This is intended to match AktieAI's existing fundamentals schema/fields.
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info or {}
+
+        data = {
+            "pe_ratio": info.get("trailingPE"),
+            "pb_ratio": info.get("priceToBook"),
+            "eps_ttm": info.get("trailingEps"),
+            "roe": info.get("returnOnEquity"),
+            "debt_equity": info.get("debtToEquity"),
+            "profit_margin": info.get("profitMargins"),
+            "beta": info.get("beta"),
+            "market_cap": info.get("marketCap"),
+            "currency": info.get("currency") or info.get("financialCurrency"),
+            "employees": info.get("fullTimeEmployees"),
+            "shares_out": info.get("sharesOutstanding"),
+            "shares_float": info.get("floatShares"),
+            "latest_annual": None,
+            "latest_interim": None,
+            "most_recent_fx": None,
+        }
+
+        # Samme "sanity check" som du har i dag
+        if sum(v is not None for v in data.values()) < 3:
+            return {"symbol": symbol, "data": None, "note": "Too few non-null fundamentals fields"}
+
+        return {"symbol": symbol, "data": serialize_data(data)}
+
+    except Exception as e:
+        return {"error": str(e), "symbol": symbol}
+
+@mcp.tool()
+def get_financials_history_quarterly(symbol: str, max_quarters: int = 8) -> Dict[str, Any]:
+    """
+    Fetch quarterly fundamentals history (max_quarters) and compute key ratios.
+    eps_ttm is computed correctly as trailing-4-quarters net income / shares_out
+    (anchored at each quarter row where possible).
+    """
+    try:
+        t = yf.Ticker(symbol)
+        info = t.info or {}
+
+        fin = getattr(t, "quarterly_financials", None)
+        bal = getattr(t, "quarterly_balance_sheet", None)
+        cf  = getattr(t, "quarterly_cashflow", None)
+
+        if fin is None or getattr(fin, "empty", True):
+            return {"symbol": symbol, "data": [], "note": "No quarterly_financials"}
+
+        fin_df = fin.T if isinstance(fin, pd.DataFrame) else pd.DataFrame()
+        bal_df = bal.T if isinstance(bal, pd.DataFrame) else pd.DataFrame()
+        cf_df  = cf.T  if isinstance(cf,  pd.DataFrame) else pd.DataFrame()
+
+        df = fin_df.join(bal_df, rsuffix="_bal", how="outer").join(cf_df, rsuffix="_cf", how="outer")
+
+        try:
+            df.index = pd.to_datetime(df.index)
+        except Exception:
+            pass
+
+        df = df.sort_index(ascending=False).head(int(max_quarters)).copy()
+        if df.empty:
+            return {"symbol": symbol, "data": [], "note": "No quarterly rows after join/head()"}
+
+        # Fallback values from info (same as today)
+        market_cap = info.get("marketCap")
+        shares_out = info.get("sharesOutstanding")
+        pb_ratio   = info.get("priceToBook")
+        beta       = info.get("beta")
+        currency   = info.get("currency") or info.get("financialCurrency")
+
+        # Dynamic column detection (same strategy as your current function)
+        def find_col(substr: str) -> Optional[str]:
+            s = substr.lower()
+            return next((c for c in df.columns if s in str(c).lower()), None)
+
+        equity_col  = find_col("equity")
+        debt_col    = find_col("debt")
+        income_col  = find_col("net income")
+        revenue_col = find_col("total revenue")
+
+        # last price for PE
+        last_price = None
+        try:
+            hist = t.history(period="1d")
+            if isinstance(hist, pd.DataFrame) and (not hist.empty) and ("Close" in hist.columns):
+                last_price = float(hist["Close"].iloc[-1])
+        except Exception:
+            last_price = None
+
+        # Helpers
+        def as_float(x):
+            try:
+                if x is None:
+                    return None
+                if isinstance(x, float) and np.isnan(x):
+                    return None
+                if pd.isna(x):
+                    return None
+                return float(x)
+            except Exception:
+                return None
+
+        # Build an aligned list of quarterly net income (descending by date)
+        net_incomes: List[Optional[float]] = []
+        for _, row in df.iterrows():
+            ni = row.get(income_col, np.nan) if income_col else np.nan
+            net_incomes.append(as_float(ni))
+
+        rows: List[Dict[str, Any]] = []
+        df_index = list(df.index)
+
+        for i, (idx, row) in enumerate(df.iterrows()):
+            # Base values for this quarter
+            net_income    = as_float(row.get(income_col, np.nan)) if income_col else None
+            total_revenue = as_float(row.get(revenue_col, np.nan)) if revenue_col else None
+            equity        = as_float(row.get(equity_col, np.nan)) if equity_col else None
+            debt          = as_float(row.get(debt_col, np.nan)) if debt_col else None
+
+            # --- TTM net income: sum of this quarter + next 3 older quarters (if present and non-null)
+            ttm_net_income = None
+            if i + 3 < len(net_incomes):
+                window = net_incomes[i:i+4]
+                if all(v is not None for v in window):
+                    ttm_net_income = float(sum(window))
+
+            eps_ttm = None
+            pe_ratio = None
+
+            try:
+                if shares_out and ttm_net_income is not None and float(shares_out) > 0:
+                    eps_ttm = ttm_net_income / float(shares_out)
+                    if last_price is not None and eps_ttm != 0:
+                        pe_ratio = last_price / eps_ttm
+            except Exception:
+                pass
+
+            roe = None
+            debt_equity = None
+            profit_margin = None
+
+            try:
+                if equity is not None and equity != 0 and net_income is not None:
+                    roe = net_income / equity
+            except Exception:
+                pass
+
+            try:
+                if equity is not None and equity != 0 and debt is not None:
+                    debt_equity = debt / equity
+            except Exception:
+                pass
+
+            try:
+                if total_revenue is not None and total_revenue != 0 and net_income is not None:
+                    profit_margin = net_income / total_revenue
+            except Exception:
+                pass
+
+            # Stable report_date formatting
+            report_date = idx
+            if hasattr(report_date, "strftime"):
+                report_date = report_date.strftime("%Y-%m-%d")
+
+            out = {
+                "report_date": report_date,
+
+                # Fields matching your current per-row output expectation
+                "eps_ttm": eps_ttm,
+                "pe_ratio": pe_ratio,
+                "roe": roe,
+                "debt_equity": debt_equity,
+                "profit_margin": profit_margin,
+
+                # Fallback/static per call (same as today)
+                "pb_ratio": pb_ratio,
+                "beta": beta,
+                "market_cap": market_cap,
+                "currency": currency,
+
+                # Optional extras that often help your cleansing/QA downstream
+                # (keep if you want; remove if you truly need identical shape)
+                "net_income": net_income,
+                "total_revenue": total_revenue,
+                "equity": equity,
+                "debt": debt,
+                "shares_out": shares_out,
+                "last_price": last_price,
+                "ttm_net_income": ttm_net_income,
+            }
+
+            rows.append(out)
+
+        payload = {
+            "symbol": symbol,
+            "data": rows,
+            "meta": {
+                "max_quarters": int(max_quarters),
+                "columns": {
+                    "equity_col": equity_col,
+                    "debt_col": debt_col,
+                    "income_col": income_col,
+                    "revenue_col": revenue_col,
+                },
+            },
+        }
+
+        return serialize_data(payload)
+
     except Exception as e:
         return {"error": str(e), "symbol": symbol}
 
